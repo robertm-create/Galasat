@@ -1,0 +1,315 @@
+// GalaSat Turbidity AOI — INFN8 VZN
+// Training: MINING_POLYGONS_850
+// All layers off by default EXCEPT those confirmed on in screenshot:
+// Permanent Water, Seasonal Flood Zone, Turbid Water, All Waterways,
+// Field-Verified Contaminated Rivers, Communities within 2km
+//
+// MEMORY TAG: AOI_WATER_LAYER  | INTERNAL VERSION: branch (not in V0–V3 mainline)
+// SOURCE: claude.ai project "Technical - Repository"
+//         chat "SuperSat_V1 code tagging" (Apr 20, 2026)
+//         pasted attachment, 290 lines, GEE filename "AOI_WATER_LAYER"
+// EXTRACTED: 2026-04-25
+//
+// PURPOSE: Research branch — water/turbidity + population exposure analysis tool.
+// Stripped multi-class architecture down to binary RF (mining vs clean vegetation).
+// First appearance of MINING_POLYGONS_850 asset (vs 800 in mainline) and WorldPop integration.
+//
+// MERGE CANDIDATES FOR V4 (per chat analysis):
+//   1. Dynamic AOI from polygon bounds + 20km buffer (vs hardcoded box rectangle)
+//   2. WorldPop population exposure calculation (popInContamZone)
+//   3. F1 score per class via errorMatrix.fscore() — exposes class-specific failure modes
+//
+// REGRESSIONS VS V2/V3 (do not blindly merge):
+//   - Binary RF (mining vs vegetation) collapses urban + scrubland into single negative class
+//   - Turbid water thresholds reverted to V1-era loose values (MNDWI > 0, NDTI > 0.05, IOR > 1.05, NDVI < 0.3)
+//   - JRC reverted to MonthlyHistory (heavyweight) instead of GlobalSurfaceWater
+//   - No SAR, no HydroSHEDS, no cumulative disturbance
+//
+// EXPANDED tier1Rivers list adds: Oti, Anum, Anikoko, Bodwire, Asesree, Assaman.
+//
+// NOTE: Whitespace partially collapsed during extraction. Logic and semicolons intact — runnable.
+
+var polygonAsset = ee.FeatureCollection('projects/galamsey-monotoring/assets/MINING_POLYGONS_850');
+
+var labeledPolygons = polygonAsset.map(function(f) {
+  var name = ee.String(f.get('Name')).toUpperCase();
+  var isMining = name.match('MERCURY').length().gt(0)
+    .or(name.match('GALAMSEY').length().gt(0))
+    .or(name.match('PIT').length().gt(0))
+    .or(name.match('LAKE').length().gt(0));
+  var cls = ee.Algorithms.If(isMining, 1, 0);
+  return f.set('class', cls);
+});
+var miningPolys = labeledPolygons.filter(ee.Filter.eq('class', 1));
+
+var AOI = polygonAsset.geometry().bounds().buffer(20000);
+
+var roads = ee.FeatureCollection('projects/galamsey-monotoring/assets/ghana_osm_roads')
+  .filterBounds(AOI)
+  .filter(ee.Filter.inList('fclass',['motorway','trunk','primary','secondary']));
+var waterways = ee.FeatureCollection('projects/galamsey-monotoring/assets/ghana_osm_waterways').filterBounds(AOI);
+var places = ee.FeatureCollection('projects/galamsey-monotoring/assets/ghana_osm_places').filterBounds(AOI);
+
+var tier1Rivers = waterways.filter(ee.Filter.inList('name',[
+  'Pra','Pra River','Offin','Offin River','Ankobra','Ankobra River',
+  'Birim','Birim River','Tano','Tano River','Densu','Densu River',
+  'Oda','Oda River','Bonsa','Bonsa River','Oti','Oti River',
+  'Fena','Fena River','Subin','Subin River','Anum','Anum River',
+  'Afram','Afram River','Anikoko','Bodwire','Asesree','Assaman'
+]));
+
+var globalMines = ee.FeatureCollection('projects/sat-io/open-datasets/global-mining/global_mining_polygons').filterBounds(AOI);
+var minesClipped = globalMines.map(function(f){return f.intersection(AOI,ee.ErrorMargin(1));});
+var totalMinesHa = ee.Number(minesClipped.map(function(f){
+  return f.set('area_ha',f.geometry().area(1).divide(10000));
+}).aggregate_sum('area_ha'));
+
+var miningBuffer = globalMines.map(function(f){return f.buffer(2000);});
+var miningBufferImage = ee.Image(0).byte().paint(miningBuffer,1);
+
+print('Mining Footprints');
+print('Mining polygons in AOI:', globalMines.size());
+print('Mining footprint area (hectares):', totalMinesHa);
+print('Confirmed river segments in AOI:', tier1Rivers.size());
+print('Total named places in AOI:', places.size());
+print('Mapped mining polygons (850 asset):', miningPolys.size());
+
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  var mask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10));
+  return image.updateMask(mask).divide(10000);
+}
+
+var s2dry = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI).filterDate('2026-01-01','2026-02-28')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+  .map(maskS2clouds).median().clip(AOI);
+
+var s2wet2025 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(AOI).filterDate('2025-06-01','2025-09-30')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',30))
+  .map(maskS2clouds).median().clip(AOI);
+
+var NDVI  = s2dry.normalizedDifference(['B8','B4']).rename('NDVI');
+var NDWI  = s2dry.normalizedDifference(['B3','B8']).rename('NDWI');
+var MNDWI = s2dry.normalizedDifference(['B3','B11']).rename('MNDWI');
+var NDTI  = s2dry.normalizedDifference(['B4','B3']).rename('NDTI');
+var BSI   = s2dry.expression('((SWIR+RED)-(NIR+BLUE))/((SWIR+RED)+(NIR+BLUE))',
+              {SWIR:s2dry.select('B11'),RED:s2dry.select('B4'),
+               NIR:s2dry.select('B8'),BLUE:s2dry.select('B2')}).rename('BSI');
+var IOR   = s2dry.select('B4').divide(s2dry.select('B2')).rename('IronOxide');
+
+var MNDWI_wet = s2wet2025.normalizedDifference(['B3','B11']).rename('MNDWI_wet');
+var NDTI_wet  = s2wet2025.normalizedDifference(['B4','B3']).rename('NDTI_wet');
+var IOR_wet   = s2wet2025.select('B4').divide(s2wet2025.select('B2')).rename('IOR_wet');
+var NDVI_wet  = s2wet2025.normalizedDifference(['B8','B4']).rename('NDVI_wet');
+
+var imageStack = s2dry.select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'])
+  .addBands(NDVI).addBands(NDWI).addBands(MNDWI).addBands(NDTI).addBands(BSI).addBands(IOR);
+
+var mSampled = imageStack.sampleRegions({
+  collection: miningPolys, properties: ['class'], scale: 30, tileScale: 4
+}).randomColumn('r1',42).sort('r1').limit(1200);
+
+var cleanPoints = imageStack.updateMask(NDVI.gt(0.6)).sample({
+  region:AOI, scale:30, numPixels:400, seed:42, geometries:true
+}).map(function(f){return f.set('class',0);});
+
+var allSamples = mSampled.merge(cleanPoints).randomColumn('random',42);
+var trainSet = allSamples.filter(ee.Filter.lt('random',0.8));
+var valSet   = allSamples.filter(ee.Filter.gte('random',0.8));
+
+print('ACCURACY CHECK');
+print('Mining samples:', mSampled.size());
+print('Clean samples:', cleanPoints.size());
+print('Total samples:', allSamples.size());
+print('Training set:', trainSet.size());
+print('Validation set:', valSet.size());
+
+var bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+             'NDVI','NDWI','MNDWI','NDTI','BSI','IronOxide'];
+
+var classifier = ee.Classifier.smileRandomForest({numberOfTrees:200, seed:42})
+  .train({features:trainSet, classProperty:'class', inputProperties:bands});
+
+var classified = imageStack.classify(classifier);
+
+var worldCover = ee.ImageCollection('ESA/WorldCover/v200').first().clip(AOI);
+var urbanMask = worldCover.neq(50).and(worldCover.neq(40));
+var roadMask = ee.Image(1).byte().paint(roads.map(function(f){return f.buffer(50);}),0);
+var finalMask = urbanMask.and(roadMask);
+
+var contaminationOnly = classified.updateMask(finalMask).updateMask(classified.eq(1)).selfMask();
+var forest = worldCover.eq(10).selfMask();
+
+var turbidWater2025 = MNDWI_wet.gt(0).and(NDTI_wet.gt(0.05))
+  .and(IOR_wet.gt(1.05)).and(NDVI_wet.lt(0.3))
+  .selfMask().rename('TurbidWater');
+
+var jrc = ee.ImageCollection('JRC/GSW1_4/MonthlyHistory')
+  .filter(ee.Filter.date('2000-01-01','2021-12-31'));
+var jrcDry = jrc.filter(ee.Filter.calendarRange(11,2,'month'))
+  .map(function(i){return i.eq(2).selfMask();}).max().clip(AOI);
+var jrcWet = jrc.filter(ee.Filter.calendarRange(6,9,'month'))
+  .map(function(i){return i.eq(2).selfMask();}).max().clip(AOI);
+var flood_zone     = jrcWet.unmask(0).subtract(jrcDry.unmask(0)).gt(0).selfMask().clip(AOI);
+var permanent_water = jrcDry.unmask(0).and(jrcWet.unmask(0)).selfMask().clip(AOI);
+
+var basin_pra     = ee.Geometry.Polygon([[[-1.95,5.85],[-1.00,5.85],[-1.00,6.85],[-1.95,6.85],[-1.95,5.85]]],null,false);
+var basin_ankobra = ee.Geometry.Polygon([[[-2.90,5.00],[-2.10,5.00],[-2.10,6.20],[-2.90,6.20],[-2.90,5.00]]],null,false);
+var basin_birim   = ee.Geometry.Polygon([[[-1.45,5.65],[-0.45,5.65],[-0.45,6.45],[-1.45,6.45],[-1.45,5.65]]],null,false);
+var basin_tano    = ee.Geometry.Polygon([[[-3.20,6.50],[-2.00,6.50],[-2.00,7.80],[-3.20,7.80],[-3.20,6.50]]],null,false);
+var basin_offin   = ee.Geometry.Polygon([[[-2.20,5.95],[-1.55,5.95],[-1.55,6.70],[-2.20,6.70],[-2.20,5.95]]],null,false);
+var basin_fc = ee.FeatureCollection([
+  ee.Feature(basin_pra,{name:'Pra'}),ee.Feature(basin_ankobra,{name:'Ankobra'}),
+  ee.Feature(basin_birim,{name:'Birim'}),ee.Feature(basin_tano,{name:'Tano'}),
+  ee.Feature(basin_offin,{name:'Offin'})
+]);
+
+var pixelArea = ee.Image.pixelArea();
+var basins = [
+  {name:'Pra',geom:basin_pra},{name:'Ankobra',geom:basin_ankobra},
+  {name:'Birim',geom:basin_birim},{name:'Tano',geom:basin_tano},
+  {name:'Offin',geom:basin_offin}
+];
+
+var allWaterwaysRaster      = ee.Image().byte().paint({featureCollection:waterways,color:1,width:1});
+var tier1Raster             = ee.Image().byte().paint({featureCollection:tier1Rivers,color:1,width:3});
+var adjacentWaterwaysRaster = ee.Image().byte().paint(
+  waterways.map(function(f){return f.buffer(30);}),1).updateMask(miningBufferImage);
+
+var miningUnion = globalMines.map(function(f){return f.buffer(2000);}).union(ee.ErrorMargin(100));
+var exposedCommunities = places.filterBounds(miningUnion.geometry());
+var exposedCommunitiesRaster = ee.Image().byte().paint({
+  featureCollection:exposedCommunities.map(function(f){return f.buffer(100);}),color:1
+});
+
+var worldPop = ee.ImageCollection('WorldPop/GP/100m/pop')
+  .filter(ee.Filter.eq('country','GHA'))
+  .filter(ee.Filter.eq('year',2020))
+  .first().clip(AOI);
+
+var cropZones = worldCover.eq(40).selfMask();
+
+var iorViz = IOR.updateMask(IOR.gt(1.5)).selfMask();
+
+var turbidAreaDict = turbidWater2025.multiply(pixelArea).divide(10000)
+  .reduceRegion({reducer:ee.Reducer.sum(),geometry:AOI,scale:30,maxPixels:1e13,bestEffort:true});
+print('Turbid Water (wet season 2025)');
+print('Turbid Water Area (hectares):', turbidAreaDict.get('TurbidWater'));
+
+var contamAreaDict = contaminationOnly.multiply(pixelArea).divide(10000)
+  .reduceRegion({reducer:ee.Reducer.sum(),geometry:AOI,scale:30,maxPixels:1e13,bestEffort:true});
+print('Mining Disturbance 2026');
+print('Mining Disturbance Area (hectares):', contamAreaDict.get('classification'));
+
+var popInContamZone = worldPop.updateMask(contaminationOnly);
+var popDict = popInContamZone.reduceRegion({
+  reducer:ee.Reducer.sum(),geometry:AOI,scale:100,maxPixels:1e13,bestEffort:true
+});
+print('Population Exposure');
+print('Est. population in contamination zone:', popDict.get('population'));
+print('Total communities in AOI:', places.size());
+print('Communities within 2km of confirmed mining:', exposedCommunities.size());
+
+print('Flood Safety');
+basins.forEach(function(b) {
+  var ha = ee.Number(pixelArea.updateMask(flood_zone.clip(b.geom))
+    .reduceRegion({reducer:ee.Reducer.sum(),geometry:b.geom,scale:30,maxPixels:1e10,bestEffort:true})
+    .get('area')).divide(10000);
+  print(ee.String(b.name).cat(': ').cat(ha.format('%.1f')).cat(' ha'));
+});
+print('SAFE deployment: Nov-Feb | RISK: Jun-Sep');
+
+var validated = valSet.classify(classifier);
+var errorMatrix = validated.errorMatrix('class','classification');
+print('Confusion Matrix');
+print('Confusion Matrix:', errorMatrix);
+print('Overall Accuracy:', errorMatrix.accuracy());
+print('Kappa:', errorMatrix.kappa());
+print('Producers Accuracy:', errorMatrix.producersAccuracy());
+print('Consumers Accuracy:', errorMatrix.consumersAccuracy());
+print('F1 per class:', errorMatrix.fscore());
+
+function getYearTurbidHa(year) {
+  var s=year+'-06-01', e=year+'-09-30';
+  function maskL8(img){var qa=img.select('QA_PIXEL');return img.updateMask(qa.bitwiseAnd(1<<3).eq(0).and(qa.bitwiseAnd(1<<4).eq(0))).select(['SR_B3','SR_B4','SR_B6']).multiply(0.0000275).add(-0.2);}
+  function maskL9(img){var qa=img.select('QA_PIXEL');return img.updateMask(qa.bitwiseAnd(1<<3).eq(0).and(qa.bitwiseAnd(1<<4).eq(0))).select(['SR_B3','SR_B4','SR_B6']).multiply(0.0000275).add(-0.2);}
+  var merged=ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterBounds(AOI).filterDate(s,e).filter(ee.Filter.lt('CLOUD_COVER',30)).map(maskL8)
+    .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2').filterBounds(AOI).filterDate(s,e).filter(ee.Filter.lt('CLOUD_COVER',30)).map(maskL9));
+  var s2=ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(AOI).filterDate(s,e).filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',30)).map(maskS2clouds);
+  var s2Ha=ee.Algorithms.If(s2.size().gte(3),
+    ee.Number(s2.median().clip(AOI).normalizedDifference(['B3','B11']).gt(0)
+      .and(s2.median().clip(AOI).normalizedDifference(['B4','B3']).gt(0.05))
+      .multiply(pixelArea).divide(10000)
+      .reduceRegion({reducer:ee.Reducer.sum(),geometry:AOI,scale:30,maxPixels:1e13,bestEffort:true}).values().get(0)),0);
+  var landsatHa=ee.Algorithms.If(merged.size().gte(3),
+    ee.Number(merged.median().clip(AOI).normalizedDifference(['SR_B3','SR_B6']).gt(0)
+      .and(merged.median().clip(AOI).normalizedDifference(['SR_B4','SR_B3']).gt(0.05))
+      .multiply(pixelArea).divide(10000)
+      .reduceRegion({reducer:ee.Reducer.sum(),geometry:AOI,scale:30,maxPixels:1e13,bestEffort:true}).values().get(0)),null);
+  return ee.Algorithms.If(merged.size().gte(3),landsatHa,s2Ha);
+}
+
+var timeSeriesFC=ee.FeatureCollection([2014,2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,2025].map(function(y){
+  return ee.Feature(null,{year:y,turbid_ha:getYearTurbidHa(y)});
+}));
+print('Time Series Chart');
+print(ui.Chart.feature.byFeature({features:timeSeriesFC,xProperty:'year',yProperties:['turbid_ha']})
+  .setChartType('LineChart').setOptions({
+    title:'GalaSat: Mining-Affected Turbid Water 2014-2025',
+    hAxis:{title:'Year',format:'####'},
+    vAxis:{title:'Turbid Water Area (hectares)'},
+    colors:['#8B0000'],lineWidth:3,pointSize:6,interpolateNulls:false
+  }));
+
+// MAP LAYERS
+// ON by default (from screenshot): Permanent Water, Seasonal Flood Zone,
+// Turbid Water, All Waterways, Field-Verified Contaminated Rivers, Communities within 2km
+// Everything else: OFF
+Map.centerObject(AOI,10);
+Map.setOptions('SATELLITE');
+
+var aoiOutline=ee.Image().byte().paint({featureCollection:ee.FeatureCollection([ee.Feature(AOI)]),color:1,width:2});
+
+Map.addLayer(s2dry,{bands:['B4','B3','B2'],min:0,max:0.3},'True Colour 2025-26',false);
+Map.addLayer(forest,{palette:['1A5C1A']},'Forest Cover',false);
+Map.addLayer(permanent_water,{palette:['#003087']},'Permanent Water',true);
+Map.addLayer(flood_zone,{palette:['#00ffff']},'Seasonal Flood Zone',true,0.85);
+Map.addLayer(contaminationOnly,{palette:['FF0000'],opacity:0.6},'Mining Disturbance Signal',false);
+Map.addLayer(turbidWater2025,{palette:['FF8C00'],opacity:0.8},'Turbid Water (wet season 2025)',true);
+Map.addLayer(globalMines,{color:'FFFF00'},'Mining Footprints — Global Mining Watch',false);
+Map.addLayer(roads,{color:'888888'},'Major Roads',false);
+Map.addLayer(allWaterwaysRaster,{palette:['4FC3F7'],opacity:0.5},'All Waterways',true);
+Map.addLayer(tier1Raster,{palette:['8B0000']},'Field-Verified Contaminated Rivers',true);
+Map.addLayer(adjacentWaterwaysRaster,{palette:['9C27B0']},'Waterways Adjacent to Confirmed Mining',true);
+Map.addLayer(exposedCommunitiesRaster,{palette:['FF00FF']},'Communities within 2km',true);
+Map.addLayer(cropZones,{palette:['#FFA500']},'Crop Zones',false);
+Map.addLayer(iorViz,{palette:['#8B4513'],min:1.5,max:3.0},'Iron Oxide Ratio (mercury proxy)',false);
+Map.addLayer(worldPop,{min:0,max:200,palette:['#FFFFE0','#FFA500','#FF0000']},'Population Density',false);
+Map.addLayer(miningPolys.style({color:'FF1744',fillColor:'FF174440',width:1}),{},'Mapped Mining Polygons',false);
+Map.addLayer(basin_fc.style({color:'FF6600',fillColor:'00000000',width:2}),{},'River Basin Boundaries',true);
+Map.addLayer(aoiOutline,{palette:['FFFFFF'],opacity:1.0},'Pilot AOI Boundary',true);
+
+// LEGEND
+var legend=ui.Panel({style:{position:'bottom-left',padding:'8px 15px',backgroundColor:'#1a1a1a'}});
+legend.add(ui.Label({value:'GalaSat — INFN8VZN',style:{fontWeight:'bold',fontSize:'14px',margin:'0 0 2px 0',color:'#F0C0E0'}}));
+legend.add(ui.Label({value:'Turbidity AOI | April 2026 | MINING_POLYGONS_850',style:{fontSize:'10px',margin:'0 0 6px 0',color:'#aaaaaa'}}));
+var makeRow=function(color,label){
+  return ui.Panel({widgets:[
+    ui.Label({value:' ',style:{backgroundColor:color,padding:'5px 9px',margin:'0 5px 2px 0'}}),
+    ui.Label({value:label,style:{fontSize:'11px',color:'#000000',backgroundColor:'#dddddd',padding:'1px 3px',margin:'1px 0'}})
+  ],layout:ui.Panel.Layout.Flow('horizontal'),style:{backgroundColor:'#1a1a1a',margin:'1px 0'}});
+};
+legend.add(makeRow('#003087','Permanent Water'));
+legend.add(makeRow('#00ffff','Seasonal Flood Zone (deployment safety)'));
+legend.add(makeRow('#FF8C00','Turbid Water (Jun-Sep 2025)'));
+legend.add(makeRow('#4FC3F7','All Waterways'));
+legend.add(makeRow('#8B0000','Field-Verified Contaminated Rivers'));
+legend.add(makeRow('#FF00FF','Communities within 2km'));
+legend.add(makeRow('#FF0000','Mining Disturbance Signal (toggle on)'));
+legend.add(makeRow('#FFFF00','Global Mining Watch (toggle on)'));
+legend.add(makeRow('#FF1744','Mapped Mining Polygons (toggle on)'));
+legend.add(makeRow('#FFFFFF','Pilot AOI Boundary'));
+Map.add(legend);
+print('GalaSat Turbidity AOI — MINING_POLYGONS_850 — Build complete');
