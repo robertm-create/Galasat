@@ -1,4 +1,4 @@
-// GalaSat v2.1 — INFN8 VZN
+// GalaSat v2.1 — INFN8 VZN + Community Search
 // Mercury Contamination Intelligence
 // Ashanti Region, Ghana | Remediation Sequencing + Biomonitoring Support
 // Base: original working code — detector improved, SRTM added, collapsible legend
