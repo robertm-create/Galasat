@@ -709,6 +709,87 @@ var adjacentWaterwaysRaster = ee.Image().byte().paint(
 ).updateMask(miningBufferImg);
 
 // ============================================================
+// CONTAMINATED WATER SURFACE
+// ============================================================
+// Union of 5 components, AOI-bounded (hard cutoff, no extrapolation):
+//   1. Turbid water pixels (turbidWater)
+//   2. Waterways adjacent to confirmed mining (adjacentWaterwaysRaster)
+//   3. Downstream-connected network segments, traced from contamination
+//      seed points along the waterway network, constrained to SRTM
+//      elevation not exceeding each basin's seed ceiling (drainage flows
+//      downhill). GEE has no D8 flow-direction primitive, so this uses
+//      ee.Algorithms.CostDistance with the waterway raster as a friction
+//      surface (masked = barrier off-network) as the flow-routing proxy.
+//   4. JRC permanent water within mining buffer zones
+//   5. Tiered river buffer — confirmed: 50m tier-1 named rivers, 15m all
+//      other waterways
+
+var waterwayNetworkRaster = ee.Image().byte().paint({
+  featureCollection: waterways, color: 1, width: 1
+}).max(ee.Image().byte().paint({
+  featureCollection: tier1Rivers, color: 1, width: 1
+}));
+
+var tieredRiverBuffer = ee.Image(0).byte().paint(
+  waterways.map(function(f){return f.buffer(15);}), 1
+).max(
+  ee.Image(0).byte().paint(tier1Rivers.map(function(f){return f.buffer(50);}), 1)
+).selfMask().rename('TieredRiverBuffer');
+
+var jrcWaterInMiningBuffer = permWater.unmask(0)
+  .and(miningBufferImg.unmask(0))
+  .selfMask().rename('JRCWaterInMiningBuffer');
+
+// Seed points: mining buffer ∩ waterway network ∩ turbid water
+var contaminationSeeds = miningBufferImg.unmask(0)
+  .and(waterwayNetworkRaster.unmask(0))
+  .and(turbidWater.unmask(0))
+  .selfMask().rename('ContaminationSeeds');
+
+var networkFriction = waterwayNetworkRaster.selfMask();
+var networkCostDistance = ee.Algorithms.CostDistance(contaminationSeeds, networkFriction, 200000);
+var reachableNetwork = networkCostDistance.mask(networkCostDistance.mask());
+
+var seedElevationCeiling = ee.FeatureCollection(basin_fc.map(function(b) {
+  var basinGeom = b.geometry();
+  var maxSeedElev = elevation.updateMask(contaminationSeeds).reduceRegion({
+    reducer: ee.Reducer.max(), geometry: basinGeom, scale: 90,
+    maxPixels: 1e13, bestEffort: true
+  }).get('elevation');
+  return b.set('max_seed_elev', maxSeedElev);
+})).filter(ee.Filter.notNull(['max_seed_elev']));
+
+var maxAoiElev = elevation.reduceRegion({
+  reducer: ee.Reducer.max(), geometry: AOI, scale: 200,
+  maxPixels: 1e13, bestEffort: true
+}).get('elevation');
+var elevCeilingImg = ee.Image().paint(seedElevationCeiling, 'max_seed_elev')
+  .unmask(ee.Image.constant(maxAoiElev))
+  .rename('ElevCeiling');
+
+var downstreamConnected = reachableNetwork
+  .updateMask(elevation.lte(elevCeilingImg))
+  .selfMask().rename('DownstreamConnected');
+
+var contaminatedWaterSurface = turbidWater.unmask(0)
+  .or(adjacentWaterwaysRaster.unmask(0))
+  .or(downstreamConnected.unmask(0))
+  .or(jrcWaterInMiningBuffer.unmask(0))
+  .or(tieredRiverBuffer.unmask(0))
+  .selfMask()
+  .clip(AOI)
+  .rename('ContaminatedWaterSurface');
+
+var contaminatedWaterSurfaceHa = contaminatedWaterSurface.multiply(pixelAreaImg).divide(10000)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: AOI, scale: 20,
+    maxPixels: 1e13, tileScale: 4, bestEffort: true
+  });
+print('Contaminated Water Surface — full envelope (ha):',
+  ee.Number(contaminatedWaterSurfaceHa.get('ContaminatedWaterSurface')).round());
+print('  Union: turbid water + waterways adj. to mining + downstream-connected network + JRC water in mining buffers + tiered river buffer (50m tier-1 / 15m minor)');
+
+// ============================================================
 // COMMUNITY EXPOSURE
 // ============================================================
 var gmwMiningUnion = globalMines.map(function(f){return f.buffer(2000);})
@@ -973,6 +1054,9 @@ layerRefs.push(Map.addLayer(tier1Raster,{palette:['8B0000']},'Water — Contamin
 layerRefs.push(Map.addLayer(permWater,{palette:['FFFFFF']},'Water — Uncontaminated Water Bodies',false));
 layerRefs.push(Map.addLayer(adjacentWaterwaysRaster,{palette:['651FFF']},'Water — Waterways Adjacent to Mining',false));
 layerRefs.push(Map.addLayer(turbidWater,{palette:['8B0000'],opacity:0.8},'Water — Mercury-Contaminated Turbid Wet Season',false));
+layerRefs.push(Map.addLayer(contaminatedWaterSurface,{palette:['B71C1C'],opacity:0.65},'Water — Contaminated Water Surface (Full Envelope)',false));
+layerRefs.push(Map.addLayer(downstreamConnected,{palette:['FF6E40']},'Water — Downstream-Connected Network (diagnostic)',false));
+layerRefs.push(Map.addLayer(contaminationSeeds,{palette:['FFEB3B']},'Water — Contamination Seed Points (diagnostic)',false));
 
 // GROUP 1 — MINING DISTURBANCE (top of panel)
 layerRefs.push(Map.addLayer(urbanPolys.style({color:'FFC107',fillColor:'FFC10740',width:1}),{},'Mining — Mapped Polygons Urban',false));
@@ -1269,6 +1353,7 @@ legendContent.add(makeRow('#7B1FA2','AI-Detected Mining Disturbance 2025'));
 legendContent.add(makeRow('#b71c1c','Iron Oxide Anomaly — ASGM Soil Contamination Signal'));
 legendContent.add(makeRow('#FF0000','New Mining Activity This Week'));
 legendContent.add(makeSection('— WATER CONTAMINATION —'));
+legendContent.add(makeRow('#B71C1C','Contaminated Water Surface — Full Envelope'));
 legendContent.add(makeRow('#8B0000','Mercury-Contaminated Water (turbid, wet season)'));
 legendContent.add(makeRow('#651FFF','Waterways Adjacent to Mining'));
 legendContent.add(makeRow('#FFFFFF','Uncontaminated Water Bodies'));
@@ -1355,6 +1440,7 @@ Map.add(searchPanel);
 // ============================================================
 Export.image.toDrive({image:rfMining,description:'INFN8VZN_RF_Mining_2025',folder:'GalaSat',fileNamePrefix:'infn8vzn_rf_mining_2025',region:AOI,scale:20,crs:'EPSG:4326',maxPixels:1e13,fileFormat:'GeoTIFF'});
 Export.image.toDrive({image:turbidWater,description:'INFN8VZN_Turbid_Water_2025',folder:'GalaSat',fileNamePrefix:'infn8vzn_turbid_water_2025',region:AOI,scale:20,crs:'EPSG:4326',maxPixels:1e13,fileFormat:'GeoTIFF'});
+Export.image.toDrive({image:contaminatedWaterSurface,description:'INFN8VZN_Contaminated_Water_Surface',folder:'GalaSat',fileNamePrefix:'infn8vzn_contaminated_water_surface',region:AOI,scale:20,crs:'EPSG:4326',maxPixels:1e13,fileFormat:'GeoTIFF'});
 Export.image.toDrive({image:floodZone,description:'INFN8VZN_Flood_Zone',folder:'GalaSat',fileNamePrefix:'infn8vzn_flood_zone',region:AOI,scale:30,crs:'EPSG:4326',maxPixels:1e13,fileFormat:'GeoTIFF'});
 Export.image.toDrive({image:cumulativeMining,description:'INFN8VZN_Cumulative_Mining_2014_2026',folder:'GalaSat',fileNamePrefix:'infn8vzn_cumulative_mining_2014_2026',region:AOI,scale:30,crs:'EPSG:4326',maxPixels:1e13,fileFormat:'GeoTIFF'});
 Export.image.toDrive({image:mercuryFlowRisk,description:'INFN8VZN_Mercury_Transport_Pathways',folder:'GalaSat',fileNamePrefix:'infn8vzn_mercury_transport_pathways',region:AOI,scale:30,crs:'EPSG:4326',maxPixels:1e13,fileFormat:'GeoTIFF'});
