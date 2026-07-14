@@ -788,9 +788,18 @@ var contaminationSeeds = miningBufferImg.unmask(0)
   .and(turbidWater.unmask(0))
   .selfMask().rename('ContaminationSeeds');
 
-var networkFriction = waterwayNetworkRaster.selfMask();
+// cumulativeCost is one of the most expensive ops in the API - at native/fine
+// resolution over a ~160x110km AOI it blows the memory limit. Reproject both
+// inputs to a fixed coarse grid first, and cap maxDistance at a distance that
+// still covers realistic downstream contamination reach without tracing the
+// full AOI diagonal (194km) from every seed.
+var costScale = 90;
+var networkFriction = waterwayNetworkRaster.selfMask()
+  .reproject({crs: 'EPSG:4326', scale: costScale});
+var contaminationSeedsForCost = contaminationSeeds
+  .reproject({crs: 'EPSG:4326', scale: costScale});
 var networkCostDistance = networkFriction.cumulativeCost({
-  source: contaminationSeeds, maxDistance: 200000
+  source: contaminationSeedsForCost, maxDistance: 30000
 });
 var reachableNetwork = networkCostDistance.mask(networkCostDistance.mask());
 
@@ -827,7 +836,7 @@ var contaminatedWaterSurface = turbidWater.unmask(0)
 var contaminatedWaterSurfaceHa = contaminatedWaterSurface.multiply(ee.Image.pixelArea()).divide(10000)
   .reduceRegion({
     reducer: ee.Reducer.sum(), geometry: AOI, scale: 20,
-    maxPixels: 1e13, tileScale: 4, bestEffort: true
+    maxPixels: 1e13, tileScale: 8, bestEffort: true
   });
 print('Contaminated Water Surface — full envelope (ha):',
   ee.Number(contaminatedWaterSurfaceHa.get('ContaminatedWaterSurface')).round());
