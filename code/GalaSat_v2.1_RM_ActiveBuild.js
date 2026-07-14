@@ -216,6 +216,22 @@ var sarChange = s1wet.select('VV_filtered').subtract(s1dry.select('VV_filtered')
 print('SAR loaded - radar imagery active');
 
 // ============================================================
+// SAR ALERT THRESHOLD
+// ============================================================
+// sarChange was visual-only — rendered on the map but had no trigger logic,
+// no flag layer, no hectare count anywhere. This closes that gap.
+var sarAlertThresholdDb = 3;
+var sarAlert = sarChange.gt(sarAlertThresholdDb).selfMask().rename('SARAlert');
+
+var sarAlertHaDict = sarAlert.multiply(ee.Image.pixelArea()).divide(10000)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: AOI, scale: 30,
+    maxPixels: 1e13, tileScale: 4, bestEffort: true
+  });
+var sarAlertHa = ee.Number(sarAlertHaDict.get('SARAlert', 0));
+print('SAR Alert — wet-dry VV backscatter change > ' + sarAlertThresholdDb + 'dB (ha):', sarAlertHa);
+
+// ============================================================
 // SPECTRAL INDICES
 // ============================================================
 function addIndicesS2(img) {
@@ -1016,6 +1032,7 @@ layerRefs.push(Map.addLayer(ironOxideAnomaly,{min:2.5,max:5.0,palette:['ff6f00',
 // COLOUR FIX: AI Mining was #7B1FA2 (collision with River Transport Risk) — changed to #AA00FF bright violet
 layerRefs.push(Map.addLayer(rfMining,{min:0,max:1,palette:['AA00FF'],opacity:0.7},'Mining — AI-Detected Disturbance 2025',false));
 layerRefs.push(Map.addLayer(newMiningImg,{min:0,max:1,palette:['FF0000'],opacity:0.9},'Mining — New Activity This Week',true));
+layerRefs.push(Map.addLayer(sarAlert,{min:0,max:1,palette:['00BFA5'],opacity:0.85},'Mining — SAR Backscatter Alert (>3dB wet-dry change)',false));
 layerRefs.push(Map.addLayer(cumulativeMining,{min:0,max:1,palette:['FF6D00'],opacity:0.7},'Mining — Cumulative Disturbance 2014-2026',false));
 layerRefs.push(Map.addLayer(m26,{min:0.0,max:0.3,palette:['FF6D00','FF8C00','FFA726','FFB74D']},'Mining — Current Activity Sentinel-2 Weekly Composite',true));
 
@@ -1216,6 +1233,7 @@ var alertDataDict = ee.Dictionary({
   ha: newMiningHa,
   currentImgs: currentWeekSize,
   previousImgs: previousWeekSize,
+  sarHa: sarAlertHa,
   windowStart: ee.Date(now.advance(-7,'day')).format('YYYY-MM-dd'),
   windowEnd: ee.Date(now).format('YYYY-MM-dd'),
   checkedAt: ee.Date(now).format('YYYY-MM-dd HH:mm')
@@ -1251,7 +1269,14 @@ alertDataDict.evaluate(function(d) {
     alertContent.add(ui.Label({value:"Recheck: next Sentinel-2 pass",style:{fontSize:"10px",color:"#888888",margin:"0"}}));
   }
 
-  alertContent.add(ui.Label({value:"Imagery window: " + d.windowStart + " to " + d.windowEnd + " | Checked: " + d.checkedAt + " UTC",style:{fontSize:"9px",color:"#AAAAAA",margin:"4px 0 0 0"}}));
+  // SAR is radar — unaffected by cloud cover, so this is shown regardless of the optical cloud gap above
+  var sarHa = d.sarHa;
+  alertContent.add(ui.Label({
+    value:"SAR backscatter alert (>3dB wet-dry change): " + sarHa.toFixed(1) + " ha",
+    style:{fontSize:"10px",color: sarHa >= 0.1 ? "#00695C" : "#888888",fontWeight: sarHa >= 0.1 ? "bold" : "normal",margin:"4px 0 0 0"}
+  }));
+
+  alertContent.add(ui.Label({value:"Imagery window: " + d.windowStart + " to " + d.windowEnd + " | Checked: " + d.checkedAt + " UTC",style:{fontSize:"9px",color:"#AAAAAA",margin:"2px 0 0 0"}}));
 });
 var alertToggleBtn = ui.Button({
   label:'► ⚠ GalaSat Alert — New Activity',
@@ -1385,6 +1410,7 @@ legendContent.add(makeRow('#FFFF00','Mining Footprints — Global Mining Watch')
 legendContent.add(makeRow('#AA00FF','AI-Detected Mining Disturbance 2025'));
 legendContent.add(makeRow('#b71c1c','Iron Oxide Anomaly — ASGM Soil Contamination Signal'));
 legendContent.add(makeRow('#FF0000','New Mining Activity This Week'));
+legendContent.add(makeRow('#00BFA5','SAR Backscatter Alert (>3dB wet-dry change)'));
 legendContent.add(makeSection('— WATER CONTAMINATION —'));
 legendContent.add(makeRow('#E65100','Mercury-Contaminated Turbid Water (wet season)'));
 legendContent.add(makeRow('#651FFF','All Waterways'));
