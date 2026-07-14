@@ -760,7 +760,7 @@ var adjacentWaterwaysRaster = ee.Image().byte().paint(
 //      seed points along the waterway network, constrained to SRTM
 //      elevation not exceeding each basin's seed ceiling (drainage flows
 //      downhill). GEE has no D8 flow-direction primitive, so this uses
-//      ee.Algorithms.CostDistance with the waterway raster as a friction
+//      Image.cumulativeCost() with the waterway raster as a friction
 //      surface (masked = barrier off-network) as the flow-routing proxy.
 //   4. JRC permanent water within mining buffer zones
 //   5. Tiered river buffer — confirmed: 50m tier-1 named rivers, 15m all
@@ -789,7 +789,9 @@ var contaminationSeeds = miningBufferImg.unmask(0)
   .selfMask().rename('ContaminationSeeds');
 
 var networkFriction = waterwayNetworkRaster.selfMask();
-var networkCostDistance = ee.Algorithms.CostDistance(contaminationSeeds, networkFriction, 200000);
+var networkCostDistance = networkFriction.cumulativeCost({
+  source: contaminationSeeds, maxDistance: 200000
+});
 var reachableNetwork = networkCostDistance.mask(networkCostDistance.mask());
 
 var seedElevationCeiling = ee.FeatureCollection(basin_fc.map(function(b) {
