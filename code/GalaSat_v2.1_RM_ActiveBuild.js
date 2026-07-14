@@ -424,11 +424,20 @@ var cumulativeMining = ml14.unmask(0).gt(0)
 var newMiningActivity = ee.Algorithms.If(
   currentWeekSize.gt(0).and(previousWeekSize.gt(0)),
   detectNewMining(currentWeek, previousWeek),
-  ee.Image(0).selfMask()
+  ee.Image(0).selfMask().rename('NewMining')
 );
 var newMiningImg = ee.Image(newMiningActivity).selfMask();
-var newMiningHa = ee.Number(0);
-print('New activity layer active — hectare calculation deferred to final build');
+
+// unmask(0) before the sum so a fully-masked "no new mining" week returns 0,
+// not null — reduceRegion over an entirely masked image returns a null value
+// for the band, which previously would have broken the alert panel's ha check
+var newMiningHaDict = newMiningImg.unmask(0).multiply(ee.Image.pixelArea()).divide(10000)
+  .reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: AOI, scale: 20,
+    maxPixels: 1e13, tileScale: 4, bestEffort: true
+  });
+var newMiningHa = ee.Number(newMiningHaDict.get('NewMining'));
+print('New activity layer — live hectare calculation (was hardcoded zero):', newMiningHa);
 
 // ============================================================
 // TURBID WATER
@@ -1263,12 +1272,38 @@ var alertVisible = false;
 var alertContent = ui.Panel({style:{margin:'0',padding:'0',shown:false}});
 var alertStatus = ui.Label({value:"Checking satellite data...",style:{fontSize:"11px",color:"#555555",margin:"0 0 4px 0"}});
 alertContent.add(alertStatus);
-newMiningHa.evaluate(function(ha) {
-  if (ha && ha >= 0.1) {
+
+// Single round trip for everything the panel needs — ha, image counts for
+// the cloud gap check, and the imagery window for the alert timestamp
+var alertDataDict = ee.Dictionary({
+  ha: newMiningHa,
+  currentImgs: currentWeekSize,
+  previousImgs: previousWeekSize,
+  windowStart: ee.Date(now.advance(-7,'day')).format('YYYY-MM-dd'),
+  windowEnd: ee.Date(now).format('YYYY-MM-dd'),
+  checkedAt: ee.Date(now).format('YYYY-MM-dd HH:mm')
+});
+
+alertDataDict.evaluate(function(d) {
+  var ha = d.ha;
+  var curN = d.currentImgs;
+  var prevN = d.previousImgs;
+  var hasData = curN > 0 && prevN > 0;
+
+  if (!hasData) {
+    // Cloud gap — do not let this render as "no activity". Missing data and
+    // confirmed absence of mining are different states and must look different.
+    alertStatus.setValue("⚠ Cloud gap — insufficient imagery this week");
+    alertStatus.style().set("color","#E65100");
+    alertStatus.style().set("fontWeight","bold");
+    alertContent.add(ui.Label({value:"Current week images: " + curN + " | Previous week images: " + prevN,style:{fontSize:"10px",color:"#555555",margin:"2px 0 0 0"}}));
+    alertContent.add(ui.Label({value:"No result does not mean no mining — data is missing, not clean. Do not report as \"no activity.\"",style:{fontSize:"10px",color:"#E65100",margin:"2px 0 2px 0",fontStyle:"italic"}}));
+    alertContent.add(ui.Label({value:"Recheck: next cloud-free Sentinel-2 pass",style:{fontSize:"10px",color:"#888888",margin:"0"}}));
+  } else if (ha >= 0.1) {
     alertStatus.setValue("New mining detected this week");
     alertStatus.style().set("color","#8B0000");
     alertStatus.style().set("fontWeight","bold");
-    alertContent.add(ui.Label({value:"Area: " + ha + " hectares",style:{fontSize:"14px",fontWeight:"bold",color:"#FF0000",margin:"2px 0"}}));
+    alertContent.add(ui.Label({value:"Area: " + ha.toFixed(2) + " hectares",style:{fontSize:"14px",fontWeight:"bold",color:"#FF0000",margin:"2px 0"}}));
     alertContent.add(ui.Label({value:"Isolated sites: 0.5 ha min | Connected expansion: 0.1 ha min",style:{fontSize:"10px",color:"#555555",margin:"0 0 2px 0"}}));
     alertContent.add(ui.Label({value:"Toggle: Mining — New Activity This Week (red layer)",style:{fontSize:"10px",color:"#555555",margin:"0"}}));
   } else {
@@ -1278,6 +1313,8 @@ newMiningHa.evaluate(function(ha) {
     alertContent.add(ui.Label({value:"Isolated: 0.5 ha min | Connected expansion: 0.1 ha min",style:{fontSize:"10px",color:"#888888",margin:"2px 0 0 0"}}));
     alertContent.add(ui.Label({value:"Recheck: next Sentinel-2 pass",style:{fontSize:"10px",color:"#888888",margin:"0"}}));
   }
+
+  alertContent.add(ui.Label({value:"Imagery window: " + d.windowStart + " to " + d.windowEnd + " | Checked: " + d.checkedAt + " UTC",style:{fontSize:"9px",color:"#AAAAAA",margin:"4px 0 0 0"}}));
 });
 var alertToggleBtn = ui.Button({
   label:'► ⚠ GalaSat Alert — New Activity',
